@@ -89,6 +89,9 @@ Or run the miner directly:
 | `-p, --pass` | `x` | Pool password; `d=4194304` for a fixed difficulty |
 | `-d, --devices` | all | GPUs to use, e.g. `0,1` |
 | `--stats` | 30 | Seconds between hashrate reports (plain-log mode) |
+| `--m` | from L2 | Rows of `A` per iteration (power of two, multiple of 128) |
+| `--n` | `65536` | Columns of `B` per job (power of two, multiple of 256) |
+| `--k` | `4096` | Common dimension (multiple of 2048, 2048…65536) |
 | `--check [MIN]` | off | GPU stability check every MIN minutes (10 if omitted) |
 | `--no-tui` | — | Plain scrolling log instead of the full-screen dashboard |
 | `--log-file` | — | Also append the log to a file |
@@ -96,6 +99,102 @@ Or run the miner directly:
 ## Dashboard and keys
 
 By default the miner shows a full-screen dashboard (hashrate, pool, shares, GPU status). Press `l` to hand the terminal back — the log is printed and normal scrolling returns — then `l` followed by Enter to switch back. `Ctrl-C` quits cleanly.
+
+## Diagnostics
+
+### `--check` — stability check while mining
+
+An unstable overclock or undervolt does not always crash the driver: it silently returns wrong
+results, the pool rejects every share, and the dashboard just sits at 0 H/s. With `--check` the
+miner re-runs a full small computation on the GPU every 10 minutes (or every `MIN` minutes) and
+compares it with the CPU reference, then says so in the log.
+
+```
+prlminer.exe -o stratum+ssl://prl-eu.kryptex.network:8048 -u YOUR_WALLET --check 10
+```
+
+### `selftest` — are the GPU kernels correct?
+
+Checks the GPU kernels against the reference implementation **and** the official `zk-pow`
+verifier, for both proof generations (Salted, `cert_version 3`, and Legacy, `cert_version 2`):
+generation, BLAKE3 commitments and seeds, noise, 1024 jackpot hashes compared one by one with the
+reference, and a `PlainProof` submitted to the official verifier.
+
+```
+prlminer.exe selftest [-d GPU]
+```
+
+```
+INFO  selftest: Salted (cert_version 3)
+INFO    kernel: mine_tma_128x2l
+INFO    generation, BLAKE3 commitments and seeds: OK
+INFO    noise: OK
+INFO    1024 jackpot hashes identical to the reference: OK
+INFO    PlainProof accepted by the official verifier, GPU hit detection: OK
+INFO  selftest: Legacy (cert_version 2)
+...
+INFO  selftest PASSED
+```
+
+Run it once after installing, and again after any driver update or overclock change.
+
+### `bench` — how fast is this GPU?
+
+Measures raw mining throughput on one GPU, without a pool.
+
+```
+prlminer.exe bench [-d GPU] [--iters 50] [--m M] [--n N] [--k K]
+```
+
+```
+INFO  GPU 0: NVIDIA GeForce RTX 5080 (sm_120, 84 SMs, 16275 MiB)
+INFO  kernel: mine_tma_128x2l
+INFO  8192x65536x4096: 24.36 ms/iter, 90.3 TMAC/s (90.3 TH/s pool units)
+```
+
+### `probe` — what is the pool actually saying?
+
+Connects to the pool and prints the raw stratum messages in both directions. No mining, no share
+is sent. This is the fastest way to see why a pool refuses you (bad address, wrong port, TLS where
+plain TCP is expected, …).
+
+```
+prlminer.exe probe -u YOUR_WALLET [-o POOL] [--seconds 60]
+```
+
+```
+INFO  connected
+<- {"id":1,"result":null,"error":{"code":24,"msg":"invalid PRL address in wallet"}}
+INFO  authorized=false {"error":{"code":24,"msg":"invalid PRL address in wallet"},"id":1,"result":null}
+WARN  disconnected: connection closed
+```
+
+## How it mines
+
+**Algorithm: NoisyGEMM (cuPOW)** — an int8 GEMM on the tensor cores (`mma.sync`), with a BLAKE3
+transcript per 8×16 tile.
+
+- Every share is re-verified on the CPU with the official `zk-pow` verifier before it is sent.
+- Proofs are gzip-compressed (Kryptex extension, type `v2`): ~4 KiB on the wire instead of 132 KiB.
+- Supported GPUs: Ampere, Ada and Blackwell (`sm_86` / `sm_89` / `sm_120`).
+
+Kernel details:
+
+- **TMA + mbarriers on sm_90+** — the last warp to release a stage reloads it, with no
+  `__syncthreads` at all.
+- **Column rasterisation** — `A'` is sized to fit in L2 (`--m` is picked automatically from the L2
+  size), and `B'` is read from VRAM only once per iteration.
+- **Raw matrices at 64 (`PRLMINER_FILL`)** — with the noise, the operands stay positive, so the
+  int32 accumulators never change sign. Fewer bits flip, which frees power budget for a higher
+  clock (+2 to 3 %).
+- **Lighter `A` preparation** — `A` is constant outside its tag, so its BLAKE3 tree is precomputed
+  per job. Each iteration only recomputes the chunk-0 path, and the noise is written without
+  reading `A` back.
+- **Three-iteration queue on the GPU with a blocking wait** — the GPU never runs dry and the CPU
+  stays free.
+- The original `cp.async` kernel is still used on Ampere and Ada.
+
+`PRLMINER_KERNEL=legacy|tma128x2|tma128x2l` forces one kernel, to compare them.
 
 ## Merge mining (NACRE)
 
